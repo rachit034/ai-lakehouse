@@ -1,0 +1,16 @@
+product_id,name,category,price,stock,description
+1,Wireless Noise-Cancelling Headphones,Electronics,299.99,150,Premium over-ear headphones with active noise cancellation and 30hr battery
+2,Ergonomic Office Chair,Furniture,499.00,45,Adjustable lumbar support chair with breathable mesh back
+3,Stainless Steel Water Bottle,Sports,34.99,500,Insulated 32oz bottle keeps drinks cold 24hrs or hot 12hrs
+4,Python Programming Book,Books,49.99,200,Comprehensive guide to Python 3 for data science and automation
+5,Standing Desk Converter,Furniture,189.00,80,Adjustable height desk riser fits monitors up to 32 inches
+6,Bluetooth Speaker,Electronics,89.99,300,Portable waterproof speaker with 360 sound and 12hr playtime
+7,Yoga Mat,Sports,45.00,250,Non-slip 6mm thick mat with alignment lines and carrying strap
+8,Mechanical Keyboard,Electronics,149.99,120,Tactile clicky switches compact tenkeyless layout RGB backlight
+9,Coffee Grinder,Kitchen,79.99,90,Burr grinder with 15 grind settings for espresso to French press
+10,Smart Watch,Electronics,249.00,200,Health tracking GPS heart rate sleep monitoring 5 day battery
+11,Laptop Stand,Electronics,59.99,400,Adjustable aluminium stand compatible with all laptops 10-17 inches
+12,Running Shoes,Sports,119.99,180,Lightweight responsive foam cushioning for road and trail running
+13,Desk Lamp,Electronics,39.99,350,LED adjustable colour temperature and brightness USB charging port
+14,Resistance Bands Set,Sports,24.99,600,Set of 5 bands ranging 10 to 50lbs for full body workouts
+15,Cast Iron Skillet,Kitchen,45.00,150,Pre-seasoned 12 inch skillet compatible with all cooktops including induction

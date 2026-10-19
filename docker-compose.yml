@@ -1,0 +1,251 @@
+---
+# AI Lakehouse Prototype — Local Dev Stack
+# Simulates: MinIO=S3, DuckDB(embedded in gateway)=Athena, Gravitino=Glue Catalog, Neo4j=Neptune
+#
+# Ports (chosen to avoid conflicts with existing playground stack):
+#   MinIO:      9100 (API), 9101 (console)   [playground uses 9000/9001]
+#   iceberg-pg: 5433                         [playground uses 5432] — backs Gravitino, not Trino
+#   Gravitino:  19090                        [container listens on 8090]
+#   Redis:      6379
+#   Neo4j:      7474 (browser), 7687 (bolt)
+#   MLflow:     5050 (UI + tracking server, container listens on 5000)
+#   Streamlit:  8501 (NL / SQL / Cypher query console)
+#   Ollama:     11434
+#   Gateway:    8088 (DuckDB runs embedded inside this process — no separate query-engine container)
+#
+# Start:  docker-compose up -d
+# Pull LLM (one-time): docker-compose exec ollama ollama pull phi3:mini
+# Gateway API docs: http://localhost:8088/docs
+# Traces:  http://localhost:5050
+# Query console: http://localhost:8501
+
+services:
+
+  # ── Storage ──────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: lh-minio
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [lakehouse]
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "/scripts/minio-init.sh"]
+    volumes:
+      - ./scripts/minio-init.sh:/scripts/minio-init.sh:ro
+      - ./sample_data:/sample_data:ro
+    networks: [lakehouse]
+
+  # ── Catalog metadata store (backs Gravitino, simulates AWS Glue's own store) ─
+  iceberg-pg:
+    image: postgres:16
+    container_name: lh-iceberg-pg
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${ICEBERG_PG_USER:-iceberg}
+      POSTGRES_PASSWORD: ${ICEBERG_PG_PASSWORD:-iceberg}
+      POSTGRES_DB: ${ICEBERG_PG_DB:-iceberg}
+    volumes:
+      - iceberg-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [lakehouse]
+
+  # ── Unified catalog (simulates AWS Glue Catalog) ──────────────────────────
+  # Iceberg REST catalog that DuckDB's iceberg extension attaches to for
+  # metadata + credential vending. Gravitino manages its own schema in
+  # iceberg-pg on first boot (no init-sql needed, unlike Trino's JDBC catalog).
+  gravitino:
+    image: apache/gravitino:1.3.0
+    container_name: lh-gravitino
+    ports:
+      - "19090:8090"
+    environment:
+      GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_URL: "jdbc:postgresql://lh-iceberg-pg:5432/${ICEBERG_PG_DB:-iceberg}"
+      GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_DRIVER: "org.postgresql.Driver"
+      GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_USER: ${ICEBERG_PG_USER:-iceberg}
+      GRAVITINO_ENTITY_STORE_RELATIONAL_JDBC_PASSWORD: ${ICEBERG_PG_PASSWORD:-iceberg}
+    depends_on:
+      iceberg-pg:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/api/metalakes"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [lakehouse]
+
+  # One-shot: creates the "lakehouse" metalake + "iceberg" catalog (JDBC-backed
+  # Iceberg REST catalog, warehouse on MinIO) that DuckDB attaches to. Mirrors
+  # minio-init's pattern — idempotent, safe to re-run.
+  gravitino-init:
+    image: curlimages/curl:8.10.1
+    container_name: gravitino-init
+    depends_on:
+      gravitino:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "/scripts/gravitino-init.sh"]
+    volumes:
+      - ./scripts/gravitino-init.sh:/scripts/gravitino-init.sh:ro
+    networks: [lakehouse]
+
+  # ── Knowledge Graph (simulates Amazon Neptune) ────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: lh-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-lakehouse123}
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [lakehouse]
+
+  # ── Observability (traces LLM calls, tool calls, SQL/Cypher queries) ─────
+  mlflow:
+    build: ./mlflow
+    image: lh-mlflow:latest
+    container_name: lh-mlflow
+    ports:
+      - "5050:5000"
+    volumes:
+      - mlflow-data:/mlflow-data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [lakehouse]
+
+  # ── Cache + semantic NL->SQL cache (RedisVL needs the search module) ─────
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: lh-redis
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_ARGS: "--save ''"   # cache only, no persistence needed
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+    networks: [lakehouse]
+
+  # ── AI Gateway (FastAPI) ──────────────────────────────────────────────────
+  # NOTE: Ollama runs on the host (not in Docker) — accessible via host.docker.internal:11434
+  gateway:
+    image: lh-gateway:latest
+    container_name: lh-gateway
+    ports:
+      - "8088:8088"
+    environment:
+      # Gravitino (Glue Catalog substitute) — DuckDB, embedded in this
+      # process, attaches its Iceberg REST catalog over HTTP
+      GRAVITINO_URI: http://lh-gravitino:8090
+      GRAVITINO_METALAKE: lakehouse
+      ICEBERG_CATALOG_NAME: iceberg
+      DEFAULT_SCHEMA: demo
+      # MinIO (S3 substitute) — DuckDB's httpfs extension talks to this
+      # directly now (previously proxied through Trino)
+      MINIO_ENDPOINT: http://lh-minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      LANCE_URI: s3://lance/
+      # Neo4j (Neptune substitute)
+      NEO4J_URI: bolt://lh-neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-lakehouse123}
+      # LLM — Colima host IP (192.168.5.2 is the Mac host as seen from inside the Colima VM)
+      OLLAMA_BASE_URL: http://192.168.5.2:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+      # Cache
+      REDIS_URL: redis://redis:6379/0
+      NL_CACHE_TTL: 300
+      # Observability (MLflow tracing)
+      MLFLOW_TRACKING_URI: http://lh-mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: ai-lakehouse-gateway
+      # Auth — one key per role. Every /query /ingest /graph /medallion route
+      # needs X-API-Key; which routes a given key can reach depends on which
+      # role it belongs to (core/auth.py).
+      API_KEY_DATA_ENGINEER: ${API_KEY_DATA_ENGINEER:?API_KEY_DATA_ENGINEER must be set in .env}
+      API_KEY_DATA_MODELER: ${API_KEY_DATA_MODELER:?API_KEY_DATA_MODELER must be set in .env}
+      API_KEY_BUSINESS: ${API_KEY_BUSINESS:?API_KEY_BUSINESS must be set in .env}
+      # Data catalog (DataHub) — runs outside this compose project, on the host.
+      # Optional: NL->SQL schema enrichment degrades gracefully if unset/unreachable.
+      DATAHUB_GMS_URL: http://host.docker.internal:18080
+    volumes:
+      - ./gateway:/app      # hot reload for dev
+    depends_on:
+      gravitino-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    networks: [lakehouse]
+    restart: unless-stopped
+
+  # ── Query Console (Streamlit UI: NL / SQL / Cypher) ───────────────────────
+  streamlit:
+    build: ./streamlit_app
+    image: lh-streamlit:latest
+    container_name: lh-streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      GATEWAY_URL: http://lh-gateway:8088
+      # All three passed through so the console can offer a role picker —
+      # whichever key you actually use, the gateway enforces what it can do.
+      API_KEY_DATA_ENGINEER: ${API_KEY_DATA_ENGINEER:?API_KEY_DATA_ENGINEER must be set in .env}
+      API_KEY_DATA_MODELER: ${API_KEY_DATA_MODELER:?API_KEY_DATA_MODELER must be set in .env}
+      API_KEY_BUSINESS: ${API_KEY_BUSINESS:?API_KEY_BUSINESS must be set in .env}
+    volumes:
+      - ./streamlit_app:/app   # hot reload for dev
+    depends_on:
+      - gateway
+    networks: [lakehouse]
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  iceberg-pg-data:
+  neo4j-data:
+  mlflow-data:
+
+networks:
+  lakehouse:
+    name: lakehouse

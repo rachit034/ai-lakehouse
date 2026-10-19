@@ -1,0 +1,37 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.12
+pydantic==2.9.0
+pydantic-settings==2.5.2
+
+# Embedded query engine (simulates Athena locally). Iceberg REST-catalog
+# write support (CTAS, INSERT/UPDATE/DELETE, MERGE INTO) needs >=1.4.0;
+# pinned to 1.5.3 for the newer ALTER TABLE / partition-transform support.
+duckdb==1.5.3
+
+# Vector store
+lancedb==0.13.0
+# fastembed (ONNX, no PyTorch needed) — shared by vector_store.py's product
+# embeddings and llm.py's semantic NL->SQL cache, see core/embeddings.py
+fastembed==0.4.1
+
+# LLM client (Ollama)
+httpx==0.27.0
+
+# Semantic NL->SQL cache — needs Redis Stack's search module (see
+# docker-compose.yml's redis service), not plain redis:7-alpine. Pulls in a
+# compatible redis-py itself, no separate `redis` pin needed.
+redisvl==0.24.0
+
+# SQL parsing / validation
+sqlglot==25.0.0
+
+# Knowledge graph (Neo4j, simulates Amazon Neptune)
+neo4j==5.24.0
+
+# Observability (traces LLM calls, tool calls, SQL/Cypher queries)
+mlflow-skinny==3.14.0
+
+# Arrow / data handling
+pyarrow==17.0.0
+pandas==2.2.3
