@@ -1,0 +1,2 @@
+# Test-only dependencies (not installed in the gateway image)
+pytest==8.3.3

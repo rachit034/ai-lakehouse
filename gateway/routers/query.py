@@ -4,6 +4,7 @@ import traceback
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from core import redaction
@@ -36,6 +37,9 @@ class QueryResult(BaseModel):
     columns: list[str] = []
     rows: list[list[Any]] = []
     row_count: int = 0
+    # True when the result hit settings.query_max_rows and was cut there —
+    # add filters/aggregation or LIMIT rather than trusting it as complete.
+    truncated: bool = False
     generated_sql: str | None = None
     cached: bool | None = None
 
@@ -58,7 +62,7 @@ def run_sql(req: SQLRequest, request: Request):
         # qualified table names instead, so pull the real schema(s) out of
         # the SQL text itself too (a join can span more than one).
         schemas = sql_engine.extract_schemas(req.sql) | ({req.schema} if req.schema else set())
-        result["rows"] = redaction.redact_rows(result["columns"], result["rows"], schema=schemas)
+        result["rows"] = redaction.redact_rows(result["columns"], result["rows"], schema=schemas, sql=req.sql)
     return QueryResult(**result)
 
 
@@ -68,10 +72,14 @@ async def run_nl(req: NLRequest, request: Request):
     Translate a natural language question to SQL and execute it.
 
     Flow: fetch schema → Ollama NL→SQL (semantically cached) → DuckDB → return results
+
+    async route, so every blocking step (catalog/DuckDB/DataHub I/O) runs in
+    the threadpool — calling them directly here would stall the event loop
+    and with it every other request the gateway is serving.
     """
     # 1. Schema context
     try:
-        schema_ctx = catalog.build_schema_context(schema=req.schema)
+        schema_ctx = await run_in_threadpool(catalog.build_schema_context, schema=req.schema)
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Schema fetch failed: {e}")
 
@@ -92,7 +100,7 @@ async def run_nl(req: NLRequest, request: Request):
 
     # 3. Execute
     try:
-        result = sql_engine.execute(sql, schema=req.schema)
+        result = await run_in_threadpool(sql_engine.execute, sql, schema=req.schema)
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -101,7 +109,9 @@ async def run_nl(req: NLRequest, request: Request):
 
     if request.state.role == "business":
         schemas = sql_engine.extract_schemas(sql) | ({req.schema} if req.schema else set())
-        result["rows"] = redaction.redact_rows(result["columns"], result["rows"], schema=schemas)
+        result["rows"] = await run_in_threadpool(
+            redaction.redact_rows, result["columns"], result["rows"], schema=schemas, sql=sql
+        )
     return QueryResult(
         **result,
         generated_sql=sql if req.explain else None,

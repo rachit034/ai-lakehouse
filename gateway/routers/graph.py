@@ -7,7 +7,9 @@ from pydantic import BaseModel
 
 from core import redaction
 from core.auth import ALL_ROLES, require_role
-from services import graph_inference, graph_store
+from fastapi.concurrency import run_in_threadpool
+
+from services import graph_inference, graph_qa, graph_store, ontology_store, write_log
 
 router = APIRouter()
 
@@ -29,9 +31,26 @@ class CypherRequest(BaseModel):
     params: dict[str, Any] | None = None
 
 
+class GraphNLRequest(BaseModel):
+    question: str
+    # Restrict to one source schema's nodes (and ground on its active ontology).
+    schema: str | None = None
+    # Also return a natural-language answer written from the result rows.
+    answer: bool = True
+
+
+class ExampleRequest(BaseModel):
+    question: str
+    cypher: str
+
+
 class InferRequest(BaseModel):
     schema: str
     limit: int = 100_000
+    # The draft version returned by GET /graph/infer. Omit to infer afresh
+    # (not recommended — inference isn't reproducible, so you'd commit a
+    # model nobody reviewed).
+    ontology_version: int | None = None
 
 
 @router.post("/build", dependencies=_modeler_only)
@@ -57,7 +76,7 @@ def query(req: CypherRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     if request.state.role == "business":
-        records = redaction.redact_records(records)
+        records = redaction.redact_records(records, cypher=req.cypher)
     return {"records": records, "count": len(records)}
 
 
@@ -81,9 +100,19 @@ def freshness(schema: str):
     the caller, not an error.
     """
     try:
-        return graph_store.get_build_freshness(schema)
+        info = graph_store.get_build_freshness(schema)
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+    # DataHub is optional — fall back to the gateway's own build record, then
+    # compare against the last write to the source schema through the gateway.
+    last_built = info.get("last_built") or write_log.last_graph_build(schema)
+    last_source_write = write_log.last_write(schema)
+    return {
+        **info,
+        "last_built": last_built,
+        "last_source_write": last_source_write,
+        "stale": write_log.is_stale(last_built, last_source_write),
+    }
 
 
 @router.get("/schema", dependencies=_any_role)
@@ -112,7 +141,7 @@ async def infer(schema: str):
     nothing is written yet.
     """
     try:
-        return await graph_inference.infer_graph_model(schema)
+        return await graph_inference.infer_and_save_draft(schema)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Inference failed: {e}")
 
@@ -125,6 +154,55 @@ async def infer_materialize(req: InferRequest):
     graph_inference.py), not hand-coded per dataset. data_modeler only.
     """
     try:
-        return await graph_inference.materialize_inferred_graph(req.schema, req.limit)
+        return await graph_inference.materialize_inferred_graph(req.schema, req.limit, req.ontology_version)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Materialization failed: {e}")
+
+
+@router.get("/ontology", dependencies=_any_role)
+def ontology(schema: str, version: int | None = None):
+    """The active ontology for `schema` (or a specific version) plus the version
+    history — what /graph/nl grounds its Cypher generation on."""
+    try:
+        current = ontology_store.get(schema, version) if version else ontology_store.get_active(schema)
+        return {"ontology": current, "versions": ontology_store.list_versions(schema)}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.post("/nl", dependencies=_any_role)
+async def graph_nl(req: GraphNLRequest, request: Request):
+    """
+    Ask the knowledge graph a question in plain English, answered entirely by
+    the local LLM: schema- and ontology-grounded Cypher generation, EXPLAIN
+    validation with a repair loop, bounded read-only execution, and an
+    optional written answer. See services/graph_qa.py for the pipeline.
+
+    business gets results redacted *before* the answer is written, so the
+    answer can't restate what redaction hid.
+    """
+    redact = None
+    if request.state.role == "business":
+        redact = lambda records, cypher: redaction.redact_records(records, cypher=cypher)  # noqa: E731
+    try:
+        return await graph_qa.answer(req.question, schema=req.schema, synthesize=req.answer, redact=redact)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Graph Q&A failed [{type(e).__name__}]: {e}")
+
+
+@router.post("/nl/examples", dependencies=_modeler_only)
+async def add_example(req: ExampleRequest):
+    """
+    Add a verified question→Cypher pair to the few-shot library /graph/nl
+    retrieves from. data_modeler only: an example teaches the model what
+    "correct" means on this graph, which is a modeling decision.
+    """
+    try:
+        await run_in_threadpool(graph_qa.add_verified_example, req.question, req.cypher)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "ok"}

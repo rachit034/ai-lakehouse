@@ -23,5 +23,5 @@ RUN python -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL iceberg')
 
 EXPOSE 8088
 
-# --reload for hot reload during dev (volume-mounted source)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8088", "--reload"]
+# No --reload here: hot reload is a dev concern, set in docker-compose.override.yml.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8088"]

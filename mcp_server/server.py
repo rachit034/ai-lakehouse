@@ -19,7 +19,9 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8088").rstrip("/")
-_TIMEOUT = httpx.Timeout(120.0)
+# Local-LLM calls (ontology inference, /graph/nl repair loop) can run several
+# minutes on a laptop-sized model — 120s cut them off mid-answer.
+_TIMEOUT = httpx.Timeout(600.0)
 
 # One MCP server subprocess = one agent invocation (agents spawn it fresh per
 # run over stdio) — so a process-lifetime run id lets every gateway call this
@@ -264,10 +266,11 @@ def graph_stats() -> dict[str, Any]:
 
 @mcp.tool()
 def infer_graph_model(schema: str) -> dict[str, Any]:
-    """Read-only: infer a graph model (nodes, relationships) from a schema's real
-    structure via naming-convention heuristics — no hand-coding, no domain
-    knowledge. Does NOT touch Neo4j. Review the result before calling
-    materialize_graph_model with the same schema. data_modeler role only.
+    """Infer a graph ontology (nodes, relationships, business descriptions) from a
+    schema's real structure AND sample rows, using the local LLM. Does not change the
+    graph — the result is saved as a numbered draft; its `ontology_version` is what
+    you pass to materialize_graph_model so exactly this reviewed model gets built.
+    data_modeler role only.
 
     Args:
         schema: Iceberg schema to infer a graph model from.
@@ -279,28 +282,33 @@ def infer_graph_model(schema: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def materialize_graph_model(schema: str, limit: int = 100_000) -> dict[str, Any]:
-    """Infers the graph model from `schema` (same as infer_graph_model) and MERGEs
-    it into Neo4j — idempotent, generic, driven by the inferred model rather than
-    hand-written per-table Cypher. data_modeler role only.
+def materialize_graph_model(schema: str, ontology_version: int | None = None, limit: int = 100_000) -> dict[str, Any]:
+    """MERGE a reviewed ontology draft into Neo4j and mark it active — idempotent.
+    Always pass the ontology_version returned by infer_graph_model: inference isn't
+    reproducible run to run, so omitting it infers (and commits) a fresh, unreviewed
+    model. data_modeler role only.
 
     Args:
-        schema: Iceberg schema to infer and materialize a graph model from.
+        schema: Iceberg schema the ontology was inferred from.
+        ontology_version: Draft version from infer_graph_model.
         limit: Per-table row cap.
     """
     with _client() as c:
-        resp = c.post("/graph/infer/materialize", json={"schema": schema, "limit": limit})
+        resp = c.post(
+            "/graph/infer/materialize",
+            json={"schema": schema, "limit": limit, "ontology_version": ontology_version},
+        )
     _raise_for_gateway_error(resp)
     return resp.json()
 
 
 @mcp.tool()
 def graph_freshness(schema: str) -> dict[str, Any]:
-    """When a schema's graph was last built/materialized, and its node/relationship
-    counts at that time. graph_stats has no notion of staleness on its own — check
-    this before trusting the graph for anything time-sensitive. Empty dict if it's
-    never been built (or the catalog is unreachable) — that's a real signal, not
-    an error: it means build_knowledge_graph or materialize_graph_model hasn't run.
+    """When a schema's graph was last built/materialized, when its source data was
+    last written through the gateway, and `stale`: true if the data changed after
+    the build (false if not, null if unknown — e.g. never built). graph_stats has
+    no notion of staleness on its own — check this before trusting the graph for
+    anything time-sensitive.
 
     Args:
         schema: Iceberg schema whose graph build history to check.
@@ -326,3 +334,39 @@ def get_graph_schema() -> dict[str, Any]:
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
+
+
+@mcp.tool()
+def ask_graph_nl(question: str, schema: str | None = None, answer: bool = True) -> dict[str, Any]:
+    """Ask the knowledge graph a question in plain English, answered by the LOCAL LLM
+    (no data leaves the machine): it writes Cypher grounded on the live schema, the
+    active ontology and verified examples, validates it with EXPLAIN, repairs it if
+    needed, runs it read-only, and (if answer=true) writes a short answer from the
+    rows. Returns the Cypher, rows, attempts, and the answer — check the Cypher
+    before trusting the answer.
+
+    Args:
+        question: The question, in plain English.
+        schema: Restrict to one source schema's part of the graph (e.g. "ecommerce").
+        answer: Also return a written answer from the results.
+    """
+    with _client() as c:
+        resp = c.post("/graph/nl", json={"question": question, "schema": schema, "answer": answer})
+    _raise_for_gateway_error(resp)
+    return resp.json()
+
+
+@mcp.tool()
+def add_graph_example(question: str, cypher: str) -> dict[str, Any]:
+    """Add a verified question -> Cypher pair to the few-shot library ask_graph_nl
+    learns from. Only add queries you have checked return the right answer.
+    data_modeler role only.
+
+    Args:
+        question: The plain-English question.
+        cypher: A Cypher query verified to answer it correctly.
+    """
+    with _client() as c:
+        resp = c.post("/graph/nl/examples", json={"question": question, "cypher": cypher})
+    _raise_for_gateway_error(resp)
+    return resp.json()

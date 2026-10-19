@@ -3,6 +3,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from fastapi.concurrency import run_in_threadpool
+
+from core import redaction
 from core.auth import ALL_ROLES, require_role
 from services import entity_resolution, gold
 
@@ -75,9 +78,18 @@ async def gold_query(req: GoldRequest, request: Request):
             detail="Persisting a Gold table (materialize=true) requires the data_modeler role.",
         )
     try:
-        return await gold.run_gold_query(
+        result = await gold.run_gold_query(
             req.question, req.source_schema, req.materialize, req.table_name
         )
+        # Ephemeral Gold results are a query response like /query/nl — the
+        # business role gets the same PII redaction there (it used to get
+        # raw values here).
+        if not req.materialize and request.state.role == "business":
+            result["rows"] = await run_in_threadpool(
+                redaction.redact_rows, result["columns"], result["rows"],
+                schema={req.source_schema}, sql=result["generated_sql"],
+            )
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

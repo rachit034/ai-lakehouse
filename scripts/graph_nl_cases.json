@@ -1,0 +1,38 @@
+[
+  {
+    "id": "orders-per-country",
+    "question": "How many orders were placed by customers in each country?",
+    "reference_cypher": "MATCH (c:Customer)-[:PLACED]->(o:Order) RETURN c.country AS country, count(o) AS orders",
+    "compare": "set"
+  },
+  {
+    "id": "top-category-revenue",
+    "question": "Which category brings in the most revenue from order line items (quantity times unit price)?",
+    "reference_cypher": "MATCH (:Order)-[r:CONTAINS]->(:Product)-[:IN_CATEGORY]->(cat:Category) RETURN cat.name AS category, sum(r.quantity * r.unit_price) AS revenue ORDER BY revenue DESC LIMIT 1",
+    "compare": "first_value"
+  },
+  {
+    "id": "supplier-count",
+    "question": "How many distinct suppliers are there?",
+    "reference_cypher": "MATCH (s:Supplier) RETURN count(DISTINCT s) AS suppliers",
+    "compare": "scalar"
+  },
+  {
+    "id": "multi-hop-supplier-country",
+    "question": "How many distinct countries have customers who bought products from each supplier?",
+    "reference_cypher": "MATCH (c:Customer)-[:PLACED]->(:Order)-[:CONTAINS]->(:Product)-[:SUPPLIED_BY]->(s:Supplier) RETURN s.name AS supplier, count(DISTINCT c.country) AS countries",
+    "compare": "set"
+  },
+  {
+    "id": "cancelled-orders",
+    "question": "How many orders have status cancelled?",
+    "reference_cypher": "MATCH (o:Order) WHERE toLower(o.status) = 'cancelled' RETURN count(o) AS orders",
+    "compare": "scalar"
+  },
+  {
+    "id": "categories-per-segment",
+    "question": "For each customer segment, how many different product categories have they bought from?",
+    "reference_cypher": "MATCH (c:Customer)-[:PLACED]->(:Order)-[:CONTAINS]->(:Product)-[:IN_CATEGORY]->(cat:Category) RETURN c.segment AS segment, count(DISTINCT cat) AS categories",
+    "compare": "set"
+  }
+]

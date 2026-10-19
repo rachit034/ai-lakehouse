@@ -1,0 +1,26 @@
+[
+  {
+    "question": "How many orders has each customer segment placed?",
+    "cypher": "MATCH (c:Customer)-[:PLACED]->(o:Order) RETURN c.segment AS segment, count(o) AS orders ORDER BY orders DESC"
+  },
+  {
+    "question": "Which products are most often bought together with Wireless Noise-Cancelling Headphones?",
+    "cypher": "MATCH (p:Product {name: 'Wireless Noise-Cancelling Headphones'})<-[:CONTAINS]-(o:Order)-[:CONTAINS]->(other:Product) WHERE other <> p RETURN other.name AS product, count(DISTINCT o) AS orders_together ORDER BY orders_together DESC LIMIT 10"
+  },
+  {
+    "question": "What else did customers who bought a given product also buy, in other orders?",
+    "cypher": "MATCH (p:Product {name: 'Smart Watch'})<-[:CONTAINS]-(:Order)<-[:PLACED]-(c:Customer)-[:PLACED]->(:Order)-[:CONTAINS]->(other:Product) WHERE other <> p RETURN other.name AS product, count(DISTINCT c) AS customers ORDER BY customers DESC LIMIT 10"
+  },
+  {
+    "question": "Which suppliers supply products in the Electronics category?",
+    "cypher": "MATCH (s:Supplier)<-[:SUPPLIED_BY]-(p:Product)-[:IN_CATEGORY]->(:Category {name: 'Electronics'}) RETURN s.name AS supplier, count(p) AS products ORDER BY products DESC"
+  },
+  {
+    "question": "Total quantity sold per category",
+    "cypher": "MATCH (:Order)-[r:CONTAINS]->(p:Product)-[:IN_CATEGORY]->(cat:Category) RETURN cat.name AS category, sum(r.quantity) AS units_sold ORDER BY units_sold DESC"
+  },
+  {
+    "question": "Which countries have customers buying from more than 3 different suppliers?",
+    "cypher": "MATCH (c:Customer)-[:PLACED]->(:Order)-[:CONTAINS]->(:Product)-[:SUPPLIED_BY]->(s:Supplier) WITH c.country AS country, count(DISTINCT s) AS suppliers WHERE suppliers > 3 RETURN country, suppliers ORDER BY suppliers DESC"
+  }
+]

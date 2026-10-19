@@ -15,6 +15,13 @@ that would provide it natively; the relationships it operates on are real
 graph state, not a database, this is the same distinction call/production
 teams make when they don't have GDS available.
 
+Scaling: candidate pairs come from *blocking*, not all-pairs. Rows are only
+compared when they share a block key — normalized email, or the first/last
+three letters of a name column — so work grows with block sizes instead of
+n². Prefix AND suffix keys mean a typo at either end of a name still lands
+the pair in a shared block; a row with typos at both ends of every name and
+no matching email will be missed, which is the standard blocking trade-off.
+
 Merge rule for building each canonical Silver record: first non-null value
 per column, in ascending primary-key order — deterministic and simple, not
 claimed to be the "right" survivorship rule for every domain (a real
@@ -28,9 +35,10 @@ from collections import defaultdict
 import mlflow
 from mlflow.entities import SpanType
 
-from services import catalog, graph_store, sql_engine
+from services import catalog, graph_store, sql_engine, write_log
 
 _STAGING_LABEL_PREFIX = "_Resolve"
+_WRITE_BATCH = 1000
 
 
 def _pk_column(schema: str, table: str) -> str:
@@ -52,6 +60,32 @@ def _similarity(a: dict, b: dict, email_col: str | None, name_cols: list[str]) -
         if va and vb:
             best = max(best, difflib.SequenceMatcher(None, str(va).lower(), str(vb).lower()).ratio())
     return best
+
+
+def _block_keys(row: dict, email_col: str | None, name_cols: list[str]) -> set[str]:
+    keys = set()
+    if email_col and row.get(email_col):
+        keys.add("e:" + str(row[email_col]).strip().lower())
+    for col in name_cols:
+        v = "".join(str(row.get(col) or "").lower().split())
+        if len(v) >= 3:
+            keys.add(f"{col}:p:{v[:3]}")
+            keys.add(f"{col}:s:{v[-3:]}")
+    return keys
+
+
+def candidate_pairs(rows: list[dict], email_col: str | None, name_cols: list[str]) -> set[tuple[int, int]]:
+    """Index pairs (i < j) of rows sharing at least one block key."""
+    blocks: dict[str, list[int]] = defaultdict(list)
+    for i, row in enumerate(rows):
+        for key in _block_keys(row, email_col, name_cols):
+            blocks[key].append(i)
+    pairs: set[tuple[int, int]] = set()
+    for members in blocks.values():
+        for a in range(len(members)):
+            for b in range(a + 1, len(members)):
+                pairs.add((members[a], members[b]))
+    return pairs
 
 
 class _UnionFind:
@@ -78,8 +112,12 @@ def find_duplicate_groups(schema: str, table: str, threshold: float = 0.85) -> d
     components (Union-Find over those edges, computed in Python).
     Returns {"pk_column": str, "groups": [[row, ...], ...], "edges_written": int}.
     """
+    sql_engine.validate_identifier(schema, "schema")
+    sql_engine.validate_identifier(table, "table")
     pk = _pk_column(schema, table)
-    result = sql_engine.execute(f"SELECT * FROM iceberg.{schema}.{table}", schema=schema)
+    # read_all: execute()'s response cap would silently drop every row past
+    # the first 1000 from Silver.
+    result = sql_engine.read_all(f"SELECT * FROM iceberg.{schema}.{table}", schema=schema)
     rows = [dict(zip(result["columns"], r)) for r in result["rows"]]
     if not rows:
         return {"pk_column": pk, "groups": [], "edges_written": 0}
@@ -88,26 +126,37 @@ def find_duplicate_groups(schema: str, table: str, threshold: float = 0.85) -> d
     email_col = next((c for c in columns if c.lower() == "email"), None)
     name_cols = [c for c in columns if "name" in c.lower() and c != email_col]
 
+    edges = []
+    for i, j in candidate_pairs(rows, email_col, name_cols):
+        score = _similarity(rows[i], rows[j], email_col, name_cols)
+        if score >= threshold:
+            edges.append({"a": rows[i][pk], "b": rows[j][pk], "score": round(score, 3)})
+
     label = f"{_STAGING_LABEL_PREFIX}_{table}"
     with graph_store._get_driver().session() as session:
+        # Staging is rebuilt from scratch each run: leftover SIMILAR_TO edges
+        # from an earlier run at a lower threshold would otherwise still be
+        # read back below and merge groups this threshold should keep apart.
+        session.run(f"MATCH (n:{label}) DETACH DELETE n")
         session.run(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.{pk} IS UNIQUE")
-        for row in rows:
-            session.run(f"MERGE (n:{label} {{{pk}: $pk}}) SET n = $row", pk=row[pk], row=row)
-
-        edges_written = 0
-        for i in range(len(rows)):
-            for j in range(i + 1, len(rows)):
-                score = _similarity(rows[i], rows[j], email_col, name_cols)
-                if score >= threshold:
-                    session.run(
-                        f"MATCH (a:{label} {{{pk}: $a}}), (b:{label} {{{pk}: $b}}) "
-                        f"MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = $score",
-                        a=rows[i][pk], b=rows[j][pk], score=round(score, 3),
-                    )
-                    edges_written += 1
+        for start in range(0, len(rows), _WRITE_BATCH):
+            session.run(
+                f"UNWIND $rows AS row MERGE (n:{label} {{{pk}: row.{pk}}}) SET n = row",
+                rows=rows[start : start + _WRITE_BATCH],
+            )
+        for start in range(0, len(edges), _WRITE_BATCH):
+            session.run(
+                f"UNWIND $edges AS e "
+                f"MATCH (a:{label} {{{pk}: e.a}}), (b:{label} {{{pk}: e.b}}) "
+                f"MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = e.score",
+                edges=edges[start : start + _WRITE_BATCH],
+            )
+        edges_written = len(edges)
 
         edge_pairs = session.run(
-            f"MATCH (a:{label})-[:SIMILAR_TO]->(b) RETURN a.{pk} AS a, b.{pk} AS b"
+            f"MATCH (a:{label})-[r:SIMILAR_TO]->(b) WHERE r.score >= $threshold "
+            f"RETURN a.{pk} AS a, b.{pk} AS b",
+            threshold=threshold,
         ).data()
 
     uf = _UnionFind([r[pk] for r in rows])
@@ -169,12 +218,16 @@ def build_silver_table(schema: str, table: str, target_schema: str = "silver", t
         for r in group_sorted:
             id_map_rows.append({"bronze_" + pk: r[pk], "silver_" + pk: canonical[pk]})
 
+    sql_engine.validate_identifier(target_schema, "schema")
     sql_engine.ensure_schema(target_schema)
 
     col_defs = ", ".join(f'"{c}" {_sql_type(canonical_rows[0][c])}' for c in columns)
     sql_engine.execute_ddl(
         f"CREATE TABLE IF NOT EXISTS iceberg.{target_schema}.{table} ({col_defs})"
     )
+    # Rebuild, don't append: re-running Silver used to INSERT the canonical
+    # rows a second time on top of the first run's.
+    sql_engine.execute_ddl(f"DELETE FROM iceberg.{target_schema}.{table}")
     values = ", ".join(
         "(" + ", ".join(_sql_literal(row[c]) for c in columns) + ")" for row in canonical_rows
     )
@@ -185,10 +238,12 @@ def build_silver_table(schema: str, table: str, target_schema: str = "silver", t
         f"CREATE TABLE IF NOT EXISTS iceberg.{target_schema}.{map_table} "
         f'("bronze_{pk}" BIGINT, "silver_{pk}" BIGINT)'
     )
+    sql_engine.execute_ddl(f"DELETE FROM iceberg.{target_schema}.{map_table}")
     map_values = ", ".join(
         f"({r['bronze_' + pk]}, {r['silver_' + pk]})" for r in id_map_rows
     )
     sql_engine.execute_ddl(f"INSERT INTO iceberg.{target_schema}.{map_table} VALUES {map_values}")
+    write_log.record_write(target_schema)
 
     return {
         "bronze_rows": sum(len(g) for g in groups),

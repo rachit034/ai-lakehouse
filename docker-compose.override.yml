@@ -1,0 +1,12 @@
+# Local development overrides — docker-compose loads this file automatically
+# on top of docker-compose.yml. It mounts source for hot reload; the base file
+# runs the images as built. Skip it with: docker-compose -f docker-compose.yml up -d
+services:
+  gateway:
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8088", "--reload"]
+    volumes:
+      - ./gateway:/app
+
+  streamlit:
+    volumes:
+      - ./streamlit_app:/app
