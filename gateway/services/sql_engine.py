@@ -8,6 +8,7 @@ compatible Iceberg REST endpoint and the S3 secret for real AWS creds.
 """
 from __future__ import annotations
 
+import re
 import threading
 
 import duckdb
@@ -32,7 +33,25 @@ _WRITE_TYPES = (exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop, exp.Al
 _SAFE_COMMAND_PREFIXES = ("SHOW", "EXPLAIN", "DESCRIBE", "DESC")
 
 _conn: duckdb.DuckDBPyConnection | None = None
-_lock = threading.Lock()
+# _init_lock guards one-time connection setup. Reads then run concurrently on
+# their own cursors (DuckDB cursors are independent connections to the same
+# database, safe to use from separate threads), bounded by _read_slots so a
+# burst of agent queries can't exhaust memory. Writes serialize on
+# _write_lock — Iceberg commits from one process should not race each other.
+_init_lock = threading.Lock()
+_write_lock = threading.Lock()
+_read_slots = threading.BoundedSemaphore(max(1, settings.duckdb_max_concurrent_queries))
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_identifier(name: str, what: str = "identifier") -> str:
+    """Schema/table/column names are interpolated into SQL (DDL can't take
+    bind parameters) — allow only plain identifiers so a caller-supplied name
+    can never carry SQL of its own."""
+    if not isinstance(name, str) or not _IDENT_RE.match(name):
+        raise ValueError(f"Invalid {what} {name!r}: must match ^[A-Za-z_][A-Za-z0-9_]*$")
+    return name
 
 
 def _strip_scheme(url: str) -> str:
@@ -41,10 +60,8 @@ def _strip_scheme(url: str) -> str:
 
 def _init_conn() -> duckdb.DuckDBPyConnection:
     """
-    One DuckDB connection for the process lifetime, guarded by _lock for
-    every use — a prototype-appropriate way to keep a single embedded
-    connection safe under concurrent FastAPI requests without standing up a
-    real connection pool. Attaches Gravitino's Iceberg REST catalog (named
+    One DuckDB database for the process lifetime; every query gets its own
+    cursor from it (see the lock/semaphore notes above). Attaches Gravitino's Iceberg REST catalog (named
     to match settings.iceberg_catalog_name, "iceberg" by default, so every
     `iceberg.{schema}.{table}` reference elsewhere in the codebase keeps
     working unchanged) and configures httpfs for direct MinIO S3 access.
@@ -92,8 +109,16 @@ def _init_conn() -> duckdb.DuckDBPyConnection:
 def _get_conn() -> duckdb.DuckDBPyConnection:
     global _conn
     if _conn is None:
-        _conn = _init_conn()
+        with _init_lock:
+            if _conn is None:
+                _conn = _init_conn()
     return _conn
+
+
+def _cursor() -> duckdb.DuckDBPyConnection:
+    conn = _get_conn()
+    with _init_lock:  # cursor creation touches shared connection state
+        return conn.cursor()
 
 
 def _assert_read_only(sql: str) -> None:
@@ -133,34 +158,58 @@ def extract_schemas(sql: str) -> set[str]:
 
 
 @mlflow.trace(name="duckdb.execute", span_type=SpanType.TOOL)
-def execute(sql: str, schema: str | None = None) -> dict:
+def execute(sql: str, schema: str | None = None, max_rows: int | None = -1) -> dict:
     """
-    Run a read-only SQL statement on DuckDB, return {columns, rows, row_count}.
-    Max 1000 rows for prototype (add pagination later).
+    Run a read-only SQL statement on DuckDB, return
+    {columns, rows, row_count, truncated}.
+
+    max_rows: -1 (default) = settings.query_max_rows, the cap for ad-hoc
+    responses; None = no cap, for internal pipelines (Silver, embeddings)
+    that must see every row. When the cap is hit, truncated=True — callers
+    are told rather than silently handed a partial result.
     """
     _assert_read_only(sql)
-    with _lock:
-        cur = _get_conn().cursor()
-        cur.execute(f"USE {settings.iceberg_catalog_name}.{schema or settings.default_schema}")
-        cur.execute(sql)
-        rows = cur.fetchmany(1000)
-        columns = [desc[0] for desc in cur.description] if cur.description else []
+    cap = settings.query_max_rows if max_rows == -1 else max_rows
+    with _read_slots:
+        cur = _cursor()
+        try:
+            cur.execute(f"USE {settings.iceberg_catalog_name}.{schema or settings.default_schema}")
+            cur.execute(sql)
+            columns = [desc[0] for desc in cur.description] if cur.description else []
+            if cap is None:
+                rows, truncated = cur.fetchall(), False
+            else:
+                rows = cur.fetchmany(cap + 1)
+                truncated = len(rows) > cap
+                rows = rows[:cap]
+        finally:
+            cur.close()
 
     return {
         "columns": columns,
         "rows": [list(r) for r in rows],
         "row_count": len(rows),
+        "truncated": truncated,
     }
+
+
+def read_all(sql: str, schema: str | None = None) -> dict:
+    """Uncapped read for internal pipelines — same read-only guard as execute()."""
+    return execute(sql, schema=schema, max_rows=None)
 
 
 @mlflow.trace(name="duckdb.execute_ddl", span_type=SpanType.TOOL)
 def execute_ddl(sql: str, schema: str | None = None) -> bool:
-    """Run a DDL/DML statement (CREATE TABLE, CREATE SCHEMA, INSERT, etc.)."""
-    with _lock:
-        cur = _get_conn().cursor()
-        if schema:
-            cur.execute(f"USE {settings.iceberg_catalog_name}.{schema}")
-        cur.execute(sql)
+    """Run a DDL/DML statement (CREATE TABLE, CREATE SCHEMA, INSERT, etc.).
+    Only ever called with SQL the application built itself."""
+    with _write_lock:
+        cur = _cursor()
+        try:
+            if schema:
+                cur.execute(f"USE {settings.iceberg_catalog_name}.{schema}")
+            cur.execute(sql)
+        finally:
+            cur.close()
     return True
 
 
@@ -168,19 +217,22 @@ def catalog_query(sql: str, params: list | None = None) -> tuple[list[str], list
     """
     Internal helper for catalog.py's introspection queries (duckdb_schemas() /
     duckdb_tables() / duckdb_columns()) — skips _assert_read_only since the SQL
-    text is always built by catalog.py itself, never caller-supplied, but still
-    goes through the same lock as every other use of the shared connection.
+    text is always built by catalog.py itself, never caller-supplied.
     """
-    with _lock:
-        cur = _get_conn().cursor()
-        cur.execute(sql, params or [])
-        rows = cur.fetchall()
-        columns = [d[0] for d in cur.description] if cur.description else []
+    with _read_slots:
+        cur = _cursor()
+        try:
+            cur.execute(sql, params or [])
+            rows = cur.fetchall()
+            columns = [d[0] for d in cur.description] if cur.description else []
+        finally:
+            cur.close()
     return columns, rows
 
 
 def ensure_schema(schema: str):
     """Create schema if it doesn't exist."""
+    validate_identifier(schema, "schema")
     execute_ddl(f"CREATE SCHEMA IF NOT EXISTS {settings.iceberg_catalog_name}.{schema}")
 
 
@@ -205,10 +257,12 @@ def create_table_from_arrow(schema: str, table_name: str, arrow_schema: pa.Schem
         pa.timestamp("ms"): "TIMESTAMP",
     }
 
+    validate_identifier(schema, "schema")
+    validate_identifier(table_name, "table")
     cols = []
     for field in arrow_schema:
         duckdb_type = type_map.get(field.type, "VARCHAR")
-        cols.append(f'"{field.name}" {duckdb_type}')
+        cols.append(f'"{field.name.replace(chr(34), chr(34) * 2)}" {duckdb_type}')
 
     ddl = (
         f"CREATE TABLE IF NOT EXISTS {settings.iceberg_catalog_name}.{schema}.{table_name} "

@@ -30,16 +30,20 @@ app = FastAPI(
         "- `/ingest/embed` — embed an Iceberg table and store in LanceDB\n"
         "- `/graph/build`  — build the knowledge graph from Iceberg tables into Neo4j\n"
         "- `/graph/query`  — run Cypher against the knowledge graph\n"
+        "- `/graph/nl`     — ask the knowledge graph in plain English (local LLM)\n"
+        "- `/graph/infer`  — infer a versioned ontology draft from a schema (local LLM)\n"
     ),
     version="0.1.0",
     lifespan=lifespan,
 )
 
+# Explicit origins, not "*": the gateway accepts API keys, and a wildcard
+# lets any web page a user visits call it from their browser.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()],
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type", "X-Agent-Name", "X-Run-Id"],
 )
 app.add_middleware(TracingMiddleware)
 

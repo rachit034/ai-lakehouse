@@ -6,9 +6,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from services import sql_engine, vector_store
+from services import sql_engine, vector_store, write_log
 
 router = APIRouter()
 
@@ -30,6 +31,17 @@ async def ingest_csv(
     3. INSERT rows in batches of 500
     """
     content = await file.read()
+    try:
+        sql_engine.validate_identifier(schema, "schema")
+        sql_engine.validate_identifier(table, "table")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Parsing + CREATE + batched INSERTs are all blocking — run them in the
+    # threadpool so a large CSV doesn't freeze every other request.
+    return await run_in_threadpool(_ingest_csv_blocking, content, schema, table)
+
+
+def _ingest_csv_blocking(content: bytes, schema: str, table: str) -> dict:
     try:
         arrow_table = pa_csv.read_csv(io.BytesIO(content))
     except Exception as e:
@@ -66,6 +78,7 @@ async def ingest_csv(
                 detail=f"INSERT failed at row {i}: {e}",
             )
 
+    write_log.record_write(schema)
     return {
         "status": "ok",
         "table": f"iceberg.{schema}.{table}",
@@ -114,10 +127,14 @@ def embed_table(req: EmbedRequest):
     """
     dataset = req.dataset or req.table
 
-    # Fetch data via DuckDB
+    # Fetch data via DuckDB — read_all, not execute(): execute() caps at
+    # settings.query_max_rows, which silently embedded only the first 1000
+    # rows of any table even when limit asked for 10,000.
     try:
-        result = sql_engine.execute(
-            f"SELECT * FROM iceberg.{req.schema}.{req.table} LIMIT {req.limit}",
+        sql_engine.validate_identifier(req.schema, "schema")
+        sql_engine.validate_identifier(req.table, "table")
+        result = sql_engine.read_all(
+            f"SELECT * FROM iceberg.{req.schema}.{req.table} LIMIT {int(req.limit)}",
             schema=req.schema,
         )
     except Exception as e:

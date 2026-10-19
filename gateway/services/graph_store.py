@@ -31,7 +31,7 @@ from mlflow.entities import SpanType
 from neo4j import GraphDatabase
 
 from core.config import settings
-from services import datahub_client, metrics, sql_engine
+from services import datahub_client, metrics, sql_engine, write_log
 
 _driver = None
 
@@ -179,6 +179,7 @@ def build_graph(schema: str = "ecommerce", limit: int = 100_000) -> dict:
     )
     counts = scoped[0] if scoped else {"nodes": 0, "relationships": 0}
     datahub_client.record_graph_build(schema, counts["nodes"], counts["relationships"])
+    write_log.record_graph_build(schema)
     return graph_stats()
 
 
@@ -207,6 +208,29 @@ def run_cypher(cypher: str, params: dict | None = None) -> list[dict]:
 
     with _get_driver().session() as session:
         return session.execute_read(_read)
+
+
+def explain_cypher(cypher: str) -> list[dict]:
+    """
+    Plan `cypher` with EXPLAIN — nothing executes — and return the planner's
+    notifications ({code, title, description}). Unknown labels, relationship
+    types and property keys come back here as warnings, which is how
+    graph_qa catches a local model inventing schema before anything runs.
+    Raises on syntax errors.
+    """
+
+    def _explain(tx):
+        summary = tx.run("EXPLAIN " + cypher).consume()
+        objs = getattr(summary, "summary_notifications", None)
+        if objs is not None:
+            return [{"code": n.code, "title": n.title, "description": n.description} for n in objs]
+        return [
+            {"code": n.get("code"), "title": n.get("title"), "description": n.get("description")}
+            for n in (summary.notifications or [])
+        ]
+
+    with _get_driver().session() as session:
+        return session.execute_read(_explain)
 
 
 @mlflow.trace(name="graph_store.graph_stats", span_type=SpanType.TOOL)
@@ -243,6 +267,8 @@ def build_schema_context() -> str:
         if rec["propertyName"] == "_node_key":  # internal — see module docstring
             continue
         label = rec["nodeLabels"][0] if rec["nodeLabels"] else "?"
+        if label.startswith("_"):  # internal: _Ontology, _Resolve_* staging
+            continue
         ptype = (rec["propertyTypes"] or ["ANY"])[0]
         node_props[label].append((rec["propertyName"], ptype))
 
@@ -254,8 +280,10 @@ def build_schema_context() -> str:
             rel_props[rel_type].append((rec["propertyName"], ptype))
 
     connectivity = run_cypher(
-        "MATCH (a)-[r]->(b) RETURN DISTINCT labels(a)[0] AS from_label, "
-        "type(r) AS rel_type, labels(b)[0] AS to_label"
+        "MATCH (a)-[r]->(b) WITH DISTINCT labels(a)[0] AS from_label, "
+        "type(r) AS rel_type, labels(b)[0] AS to_label "
+        "WHERE NOT from_label STARTS WITH '_' AND NOT to_label STARTS WITH '_' "
+        "RETURN from_label, rel_type, to_label"
     )
 
     lines = ["Nodes:"]

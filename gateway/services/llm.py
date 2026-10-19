@@ -8,10 +8,16 @@ customer with maximum orders" and "customer with max orders" hash to
 different strings but embed to nearly the same vector, so the old
 hash-keyed Redis cache always missed on rephrasing. Requires the Redis
 Stack search module (redis/redis-stack-server), not plain redis:7-alpine.
+
+A semantic hit alone isn't enough to reuse SQL: "revenue in 2024" and
+"revenue in 2023" are near-identical vectors that need different SQL. Every
+entry is also tagged with core/nl_cache_key.literal_signature(), and a hit
+must match it exactly — see that module.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 
 import httpx
@@ -24,6 +30,7 @@ from redisvl.utils.vectorize.text.custom import CustomVectorizer
 
 from core.config import settings
 from core.embeddings import embed_one
+from core.nl_cache_key import literal_signature
 
 _NL_TO_SQL_PROMPT = """You are a SQL expert for DuckDB.
 Generate a single SQL SELECT query based on the question below.
@@ -52,7 +59,9 @@ def _get_cache() -> SemanticCache:
     global _cache
     if _cache is None:
         _cache = SemanticCache(
-            name="nl_sql_cache",
+            # v2: adds the literal_sig filter field — a new index name so an
+            # existing v1 index (different schema) doesn't fail startup.
+            name="nl_sql_cache_v2",
             redis_url=settings.redis_url,
             vectorizer=CustomVectorizer(embed=embed_one),
             distance_threshold=settings.nl_cache_distance_threshold,
@@ -60,7 +69,10 @@ def _get_cache() -> SemanticCache:
             # schema_hash-scoped so a cached translation never leaks across
             # schemas — the same question can mean a different query, or no
             # longer be valid SQL at all, if the underlying tables differ.
-            filterable_fields=[{"name": "schema_hash", "type": "tag"}],
+            filterable_fields=[
+                {"name": "schema_hash", "type": "tag"},
+                {"name": "literal_sig", "type": "tag"},
+            ],
         )
     return _cache
 
@@ -84,21 +96,33 @@ def _validate_sql(sql: str) -> str:
 
 
 @mlflow.trace(name="ollama.generate", span_type=SpanType.LLM)
-async def _call_ollama(prompt: str, timeout: float = 120) -> str:
+async def _call_ollama(prompt: str, timeout: float = 120, json_schema: dict | None = None) -> str:
+    body = {
+        "model": settings.ollama_model,
+        "prompt": prompt,
+        "stream": False,
+        # no num_predict cap — thinking models (qwen3) need budget for CoT
+        "options": {"temperature": 0},
+    }
+    if json_schema is not None:
+        # Ollama structured outputs: decoding is constrained to this JSON
+        # schema, so a small local model can't return a bare array, prose, or
+        # markdown fences — the envelope is guaranteed; only content can be wrong.
+        body["format"] = json_schema
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            f"{settings.ollama_base_url}/api/generate",
-            json={
-                "model": settings.ollama_model,
-                "prompt": prompt,
-                "stream": False,
-                # no num_predict cap — thinking models (qwen3) need budget for CoT
-                "options": {"temperature": 0},
-            },
-        )
+        resp = await client.post(f"{settings.ollama_base_url}/api/generate", json=body)
         resp.raise_for_status()
         # Ollama returns thinking in a separate field; response = final answer only
         return resp.json()["response"]
+
+
+async def generate_json(prompt: str, json_schema: dict, timeout: float = 300) -> dict:
+    """Local-LLM call whose output is constrained to `json_schema` and parsed."""
+    raw = await _call_ollama(prompt, timeout=timeout, json_schema=json_schema)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Local LLM returned invalid JSON despite schema constraint: {e}\n{raw[:500]}") from e
 
 
 @mlflow.trace(name="llm.nl_to_sql", span_type=SpanType.CHAIN)
@@ -108,9 +132,13 @@ async def nl_to_sql(question: str, schema_context: str) -> dict:
     Returns {sql, cached: bool}.
     """
     schema_hash = hashlib.md5(schema_context.encode()).hexdigest()[:8]
+    literal_sig = literal_signature(question)
     cache = _get_cache()
 
-    cached = await cache.acheck(prompt=question, filter_expression=(Tag("schema_hash") == schema_hash))
+    cached = await cache.acheck(
+        prompt=question,
+        filter_expression=(Tag("schema_hash") == schema_hash) & (Tag("literal_sig") == literal_sig),
+    )
     if cached:
         mlflow.update_current_trace(tags={"cache": "hit"})
         return {"sql": cached[0]["response"], "cached": True}
@@ -120,6 +148,8 @@ async def nl_to_sql(question: str, schema_context: str) -> dict:
     raw_sql = await _call_ollama(prompt)
     sql = _validate_sql(_parse_sql(raw_sql))
 
-    await cache.astore(prompt=question, response=sql, filters={"schema_hash": schema_hash})
+    await cache.astore(
+        prompt=question, response=sql, filters={"schema_hash": schema_hash, "literal_sig": literal_sig}
+    )
 
     return {"sql": sql, "cached": False}

@@ -30,10 +30,14 @@ Tools available to you:
   of real rows and reasons about what the tables/columns mean — not naming-convention pattern
   matching. It catches relationships a "_id suffix" heuristic can't (e.g. a column holding a
   product NAME rather than a foreign key), and can promote a low-cardinality column into its
-  own node type. Does not touch Neo4j. Self-corrects once if its own output is malformed, then
-  surfaces the error rather than guessing further.
-- materialize_graph_model — re-runs the same inference and commits the result into Neo4j
-  (idempotent MERGE), scoped to this schema so it can't collide with another schema's data
+  own node type. Does not change the graph; saves the result as a numbered draft and returns
+  its ontology_version. Self-corrects once if its output fails validation, then surfaces the
+  error rather than guessing further.
+- materialize_graph_model — commits a reviewed draft (pass its ontology_version) into Neo4j
+  (idempotent MERGE), scoped to this schema so it can't collide with another schema's data,
+  and marks it the active ontology that ask_graph_nl grounds on
+- add_graph_example — store a question -> Cypher pair you've verified as correct, so the local
+  model behind ask_graph_nl learns this graph's patterns
 - build_knowledge_graph — the older, hand-coded model for the "ecommerce" schema specifically
   (Customer/Order/Product with named relationships PLACED/CONTAINS/IN_CATEGORY/SUPPLIED_BY) —
   use this instead of infer+materialize when the schema is "ecommerce" and that specific,
@@ -50,7 +54,9 @@ Approach:
    review step, not a formality: it's still a small model doing the reasoning, and inferred
    relationship names (HAS_X) are generated, not necessarily the domain's actual vocabulary.
 2. Only call materialize_graph_model (or build_knowledge_graph) after the user has seen and
-   confirmed the model, unless they explicitly say to just go ahead.
+   confirmed the model, unless they explicitly say to just go ahead — and always pass the
+   ontology_version you showed them. Inference isn't reproducible, so materializing without it
+   would commit a different model from the one the user reviewed.
 3. For the "ecommerce" schema specifically, prefer build_knowledge_graph — it has real
    relationship names and derived Category/Supplier nodes that infer_graph_model deliberately
    doesn't attempt (see graph_inference.py's docstring: promoting a low-cardinality column into
@@ -72,6 +78,7 @@ def _options() -> ClaudeAgentOptions:
             "mcp__lakehouse__build_knowledge_graph",
             "mcp__lakehouse__graph_stats",
             "mcp__lakehouse__graph_freshness",
+            "mcp__lakehouse__add_graph_example",
         ],
         permission_mode="bypassPermissions",
     )

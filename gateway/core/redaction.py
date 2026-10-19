@@ -28,6 +28,9 @@ from __future__ import annotations
 import re
 import time
 
+import sqlglot
+from sqlglot import exp
+
 from core.config import settings
 from services import datahub_client
 
@@ -89,15 +92,16 @@ def _catalog_masked_fields(schemas: str | set[str] | None) -> set[str]:
 
 _EMAIL_RE = re.compile(r"^([^@]{1,3})[^@]*(@.+)$")
 
-# Column/key names are trivial to dodge — `RETURN c.email AS x` or
-# `SELECT email AS x` renames the field the redactor keys off of. Email has a
-# distinctive enough format to catch by VALUE regardless of column name, so
-# every string value gets scanned for that shape as a second pass. First/last
-# names have no such format (any short word could be one) — there's no
-# reliable value-based catch for those, so an aliased `first_name AS x` *will*
-# slip through unredacted. Column-name matching is a real but incomplete
-# guardrail, not a hardened one; it stops the default case, not someone
-# deliberately trying to route around it.
+# Column/key names alone are trivial to dodge — `SELECT email AS x`,
+# `concat(first_name, last_name)`, `RETURN c.first_name AS n` all rename the
+# field. So the query text is traced too: any output column whose expression
+# derives from a masked column (through aliases, functions, subqueries, CTEs,
+# WITH clauses) is masked — see sql_derived_masked_columns() and
+# cypher_derived_masked_keys(). count(...) of a masked column is exempt: a
+# count isn't the value. As a last net, every string value is also scanned
+# for email shape regardless of where it came from. The durable fix — the
+# business role reading PII-masked views so raw columns are unreachable —
+# is in docs/ARCHITECTURE-PROPOSAL.md.
 _EMAIL_VALUE_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$")
 
 
@@ -128,15 +132,157 @@ def _mask_value_if_email_shaped(value):
     return value
 
 
-def redact_rows(columns: list[str], rows: list[list], schema: str | set[str] | None = None) -> list[list]:
+# ── Query-text lineage ───────────────────────────────────────────────────────
+
+def _under_count(node: exp.Expression, stop: exp.Expression) -> bool:
+    cur = node.parent
+    while cur is not None and cur is not stop:
+        if isinstance(cur, exp.Count):
+            return True
+        cur = cur.parent
+    return False
+
+
+def _refs_masked(proj: exp.Expression, masked: set[str]) -> bool:
+    return any(
+        col.name.lower() in masked and not _under_count(col, proj)
+        for col in proj.find_all(exp.Column)
+    )
+
+
+def _output_positions(stmt: exp.Expression, masked: set[str]) -> list[bool] | None:
+    """Per-output-column masked flags for the outermost query, or None when
+    positions can't be known statically (SELECT *)."""
+    if isinstance(stmt, exp.Union):
+        left = _output_positions(stmt.left, masked)
+        right = _output_positions(stmt.right, masked)
+        if left is None or right is None or len(left) != len(right):
+            return None
+        return [a or b for a, b in zip(left, right)]
+    if isinstance(stmt, exp.Subquery):
+        return _output_positions(stmt.this, masked)
+    if not isinstance(stmt, exp.Select):
+        return None
+    if any(isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))
+           for p in stmt.expressions):
+        return None
+    return [_refs_masked(p, masked) for p in stmt.expressions]
+
+
+def sql_derived_masked_columns(sql: str, base_masked: set[str]) -> tuple[set[str], list[bool] | None]:
+    """
+    Returns (masked_names, masked_positions) for a SELECT:
+      masked_names     every column name/alias anywhere in the query that
+                       derives from a base masked column (fixpoint over all
+                       SELECTs, so a CTE aliasing email AS x, selected again
+                       by an outer query, still taints x)
+      masked_positions per-output-column flags for the outermost SELECT, so
+                       unaliased expressions like concat(first_name, ...) —
+                       whose DuckDB column name can't be predicted — are still
+                       caught; None when SELECT * makes positions unknowable
+    Unparseable SQL returns the base set unchanged (name matching still applies).
+    """
+    masked = {m.lower() for m in base_masked}
+    try:
+        stmt = sqlglot.parse_one(sql, dialect="duckdb")
+    except Exception:
+        return masked, None
+    if stmt is None:
+        return masked, None
+
+    changed = True
+    while changed:
+        changed = False
+        for select in stmt.find_all(exp.Select):
+            for proj in select.expressions:
+                name = (proj.alias_or_name or "").lower()
+                if name and name not in masked and _refs_masked(proj, masked):
+                    masked.add(name)
+                    changed = True
+    return masked, _output_positions(stmt, masked)
+
+
+_CYPHER_CLAUSE_RE = re.compile(
+    r"\b(WITH|RETURN)\b(?:\s+DISTINCT\b)?(.*?)(?=\b(?:MATCH|OPTIONAL|WHERE|ORDER\s+BY|SKIP|LIMIT|WITH|RETURN|UNWIND|CALL|UNION|CREATE|MERGE|SET|DELETE)\b|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CYPHER_ALIAS_RE = re.compile(r"\s+AS\s+`?(\w+)`?\s*$", re.IGNORECASE)
+
+
+def _split_top_level(text: str) -> list[str]:
+    items, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            items.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    items.append("".join(cur))
+    return [i.strip() for i in items if i.strip()]
+
+
+def cypher_derived_masked_keys(cypher: str, base_masked: set[str]) -> set[str]:
+    """Result keys of a Cypher query that derive from masked properties,
+    following aliases through WITH clauses to the final RETURN."""
+    masked = {m.lower() for m in base_masked}
+    keys: set[str] = set()
+    without_count = re.compile(r"count\s*\([^()]*\)", re.IGNORECASE)
+    for _, body in _CYPHER_CLAUSE_RE.findall(cypher):
+        for item in _split_top_level(body):
+            m = _CYPHER_ALIAS_RE.search(item)
+            expr = item[: m.start()] if m else item
+            name = (m.group(1) if m else item).strip()
+            probe = without_count.sub("", expr)
+            props = {p.lower() for p in re.findall(r"\.\s*`?(\w+)`?", probe)}
+            bare = {w.lower() for w in re.findall(r"\b(\w+)\b", probe)}
+            if props & masked or bare & masked:
+                masked.add(name.lower())
+                keys.add(name)
+    return keys
+
+
+# ── Redaction ────────────────────────────────────────────────────────────────
+
+def _key_is_masked(key: str, masked: set[str]) -> bool:
+    k = key.lower()
+    return k in masked or k.rsplit(".", 1)[-1] in masked
+
+
+def _redact_value(value, masked: set[str]):
+    """Recursive: a Cypher `RETURN c` yields the whole node as a dict of
+    properties, and collect()/lists nest further — mask PII keys at any depth."""
+    if isinstance(value, dict):
+        return {k: (_mask(k.rsplit(".", 1)[-1], v) if _key_is_masked(k, masked) and not isinstance(v, (dict, list))
+                    else _redact_value(v, masked))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(v, masked) for v in value]
+    return _mask_value_if_email_shaped(value)
+
+
+def redact_rows(
+    columns: list[str],
+    rows: list[list],
+    schema: str | set[str] | None = None,
+    sql: str | None = None,
+) -> list[list]:
     """Redact PII columns in SQL-style {columns, rows} results (/query/sql, /query/nl).
 
     `schema` (a schema name, or a set of them for a multi-schema join) pulls
     in DataHub-tagged Consumer.Modeler/Engineer columns for those schemas'
     tables in addition to the static PII_FIELDS — see module docstring.
+    `sql`, when given, extends masking to every output column derived from
+    a masked column — see sql_derived_masked_columns().
     """
-    dynamic = {f.lower() for f in _catalog_masked_fields(schema)}
-    pii_idx = {i for i, c in enumerate(columns) if is_pii_field(c) or c.lower() in dynamic}
+    base = PII_FIELDS | {f.lower() for f in _catalog_masked_fields(schema)}
+    masked, positions = (sql_derived_masked_columns(sql, base) if sql else (base, None))
+    pii_idx = {i for i, c in enumerate(columns) if _key_is_masked(c, masked)}
+    if positions is not None and len(positions) == len(columns):
+        pii_idx |= {i for i, flag in enumerate(positions) if flag}
     redacted = []
     for row in rows:
         row = list(row)
@@ -144,25 +290,19 @@ def redact_rows(columns: list[str], rows: list[list], schema: str | set[str] | N
             if i in pii_idx:
                 row[i] = _mask(columns[i], row[i])
             else:
-                row[i] = _mask_value_if_email_shaped(row[i])
+                row[i] = _redact_value(row[i], masked)
         redacted.append(row)
     return redacted
 
 
-def redact_records(records: list[dict], schema: str | None = None) -> list[dict]:
-    """Redact PII keys in dict-style results (/query/vector, /graph/query).
+def redact_records(records: list[dict], schema: str | None = None, cypher: str | None = None) -> list[dict]:
+    """Redact PII keys in dict-style results (/query/vector, /graph/query, /graph/nl).
 
-    `schema` is optional and unused by current callers (neither vector
-    datasets nor Cypher results carry a clean single Iceberg schema to key
-    catalog lookups off of) — kept for API symmetry with redact_rows, and so
-    a future caller that does have a schema can opt in without a signature
-    change.
+    Recursive (whole nodes returned as dicts are masked inside), matches
+    dotted keys like "c.first_name" on their last segment, and — when the
+    Cypher text is given — masks aliases derived from PII properties.
     """
-    dynamic = {f.lower() for f in _catalog_masked_fields(schema)}
-    return [
-        {
-            k: (_mask(k, v) if (is_pii_field(k) or k.lower() in dynamic) else _mask_value_if_email_shaped(v))
-            for k, v in rec.items()
-        }
-        for rec in records
-    ]
+    masked = PII_FIELDS | {f.lower() for f in _catalog_masked_fields(schema)}
+    if cypher:
+        masked = masked | {k.lower() for k in cypher_derived_masked_keys(cypher, masked)}
+    return [_redact_value(rec, masked) for rec in records]

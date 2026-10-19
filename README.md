@@ -1,6 +1,8 @@
 # ai-lakehouse
 
-A local, laptop-sized prototype of an **AI-native data lakehouse**. It combines an Iceberg lakehouse, a knowledge graph, vector search, and LLM-powered querying behind one role-secured API, which Claude agents drive through MCP.
+A local, laptop-sized prototype of an **AI-native data lakehouse**. It combines an Iceberg lakehouse, a knowledge graph, vector search, and LLM-powered querying behind one role-secured API, which agents drive through MCP.
+
+**Direction:** a **local LLM** builds the knowledge-graph ontology from the lakehouse tables and answers complex questions from the graph, with no frontier API and no data leaving the machine. The Claude agents are a stand-in until local models are good enough, as measured by the eval suite. See [docs/ARCHITECTURE-PROPOSAL.md](docs/ARCHITECTURE-PROPOSAL.md) for the target architecture and roadmap.
 
 Every component is an open-source stand-in for a managed AWS service, so the same design maps onto a cloud deployment:
 
@@ -28,13 +30,22 @@ Every component is an open-source stand-in for a managed AWS service, so the sam
    - LanceDB handles vector search.
    - Neo4j holds the knowledge graph.
 
+### Local-LLM knowledge graph
+
+1. **Ontology inference:** `GET /graph/infer`. The local LLM reads table structure and sample rows and proposes nodes, relationships and business descriptions. Its output is constrained to a JSON schema, and the result is saved as a numbered **draft**.
+2. **Review and commit:** `POST /graph/infer/materialize` with that `ontology_version`. This commits exactly the model you reviewed and marks it **active**.
+3. **Ask:** `POST /graph/nl`. The local LLM writes Cypher grounded on the live schema, the active ontology and verified examples. Neo4j `EXPLAIN` checks the query before it runs, and problems go back to the model to repair. The query then runs read-only, and an answer is written from the redacted rows.
+4. **Improve:** `POST /graph/nl/examples` adds verified question→Cypher pairs. `scripts/eval_graph_nl.py` measures accuracy.
+
 ### Roles
 
 | Role | Can reach |
 |---|---|
 | `data_engineer` | `/ingest/*` and every read route |
-| `data_modeler` | `/graph/build`, `/graph/infer*`, `/medallion/silver/*`, Gold materialization, and every read route |
-| `business` | Read routes only: `/query/*`, `/graph/query`, `/graph/stats`, `/graph/freshness`, `/medallion/gold` (query only) |
+| `data_modeler` | `/graph/build`, `/graph/infer*`, `/graph/nl/examples`, `/medallion/silver/*`, Gold materialization, and every read route |
+| `business` | Read routes only: `/query/*`, `/graph/query`, `/graph/nl`, `/graph/ontology`, `/graph/stats`, `/graph/freshness`, `/medallion/gold` (query only). PII is redacted, including through aliases and expressions. |
+
+Besides the three shared role keys, you can issue named per-person keys (`API_KEYS=alice:business:<key>`), so traces record who made each call.
 
 ### Medallion layers
 
@@ -46,14 +57,15 @@ Every component is an open-source stand-in for a managed AWS service, so the sam
 
 ```
 gateway/          FastAPI AI gateway (routers, auth, PII redaction, tracing, services)
-mcp_server/       MCP server exposing the gateway as 15 tools
+gateway/tests/    Unit + route tests (no services needed)
+mcp_server/       MCP server exposing the gateway as 17 tools
 agents/           Claude Agent SDK agents: ingestion, modeler, data_analyst, graph, router
 streamlit_app/    Query console (NL / SQL / Cypher)
 data_generator/   Synthetic e-commerce star schema + Iceberg loader
 sample_data/      Small CSVs for ingestion demos
-scripts/          MinIO / Gravitino init, metrics smoke test
+scripts/          MinIO / Gravitino init, metrics smoke test, graph Q&A eval
 mlflow/           MLflow tracking server image
-docs/             Architecture diagram (draw.io + SVG) and its generator
+docs/             Architecture diagrams (current + target, draw.io + SVG), proposal
 ```
 
 ## Quick start
@@ -69,9 +81,9 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 # 2. Pull the local LLM
 ollama pull qwen3:4b
 
-# 3. Build the gateway image and start the stack
-docker build -t lh-gateway:latest ./gateway
-docker-compose up -d
+# 3. Build and start the stack (also applies docker-compose.override.yml:
+#    hot reload + source mounts for development)
+docker-compose up -d --build
 
 # 4. Generate and load sample data into Iceberg
 cd data_generator
@@ -80,7 +92,9 @@ uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -r requi
 .venv/bin/python load_to_iceberg.py --schema ecommerce --gravitino-uri http://localhost:19090
 ```
 
-> **Ollama host address:** `docker-compose.yml` points the gateway at `http://192.168.5.2:11434`, which is the macOS host as seen from Colima. On Docker Desktop, change `OLLAMA_BASE_URL` to `http://host.docker.internal:11434`.
+> **Ollama host address:** the default is `http://host.docker.internal:11434`, which works on Docker Desktop and Linux. On Colima, set `OLLAMA_BASE_URL=http://192.168.5.2:11434` in `.env`.
+>
+> **Without dev overrides:** `docker-compose -f docker-compose.yml up -d` runs the built images without hot reload or source mounts.
 
 ### Endpoints
 
@@ -121,16 +135,31 @@ export API_KEY_BUSINESS=$(grep API_KEY_BUSINESS ../.env | cut -d= -f2)
 
 If a DataHub GMS is reachable at `http://host.docker.internal:18080`, the gateway uses its descriptions and tags. They enrich NL→SQL prompts and drive column masking. Without DataHub, those features fall back to built-in defaults.
 
-## Regenerating the diagram
+## Tests and evaluation
 
-`docs/architecture.drawio` and `docs/architecture.svg` are both produced from `docs/gen_diagram.py`:
+```bash
+# Unit + route tests: no Docker needed (DuckDB runs in-memory, LLM/Neo4j are mocked)
+cd gateway
+uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest tests
+
+# Local-LLM graph Q&A accuracy against the running stack
+export API_KEY_DATA_MODELER=$(grep API_KEY_DATA_MODELER ../.env | cut -d= -f2)
+python3 ../scripts/eval_graph_nl.py
+```
+
+Run the eval before and after changing the model, the prompts or the example library. Keep eval questions out of `gateway/graph_examples.json`.
+
+## Regenerating the diagrams
+
+`docs/architecture.*` (current) and `docs/architecture-target.*` (proposed) are both produced from `docs/gen_diagram.py`:
 
 ```bash
 python3 docs/gen_diagram.py docs
 ```
 
-You can also edit the `.drawio` file directly in draw.io and export it as SVG.
+You can also edit the `.drawio` files directly in draw.io and export them as SVG.
 
 ## Status
 
-This is a prototype for exploring the architecture, not a production system. Auth is static per-role API keys, and the compose stack is tuned for local development, with hot reload and default ports.
+This is a prototype for exploring the architecture, not a production system. Auth uses static API keys (per role, with optional named keys). Heavy jobs such as graph builds and Silver still run inside HTTP requests. DuckDB runs embedded in a single gateway process. [docs/ARCHITECTURE-PROPOSAL.md](docs/ARCHITECTURE-PROPOSAL.md) lays out the path past each of these.

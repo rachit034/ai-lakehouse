@@ -17,15 +17,71 @@ already gets on query results (core/redaction.py).
 """
 from __future__ import annotations
 
+import asyncio
 import json
-import re
 
 import mlflow
 from mlflow.entities import SpanType
 
 from core.config import settings
-from services import catalog, datahub_client, graph_store, sql_engine
-from services.llm import _call_ollama
+from services import catalog, datahub_client, graph_store, ontology_store, sql_engine, write_log
+from services.llm import generate_json
+
+_WRITE_BATCH = 1000
+
+# Ollama structured-output schema: decoding is constrained to this shape, so
+# the local model can no longer return a bare array or drop "relationships" —
+# the failure the self-correction pass below was originally added for. What
+# remains for _validate_model() to catch is *semantic* (unknown tables,
+# columns, labels), which is where the self-correction pass now earns its keep.
+_END_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["self", "id_lookup", "value_lookup"]},
+        "label": {"type": "string"},
+        "row_column": {"type": "string"},
+        "match_property": {"type": "string"},
+    },
+    "required": ["kind", "label"],
+}
+ONTOLOGY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "nodes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["table", "value"]},
+                    "table": {"type": "string"},
+                    "pk_column": {"type": "string"},
+                    "properties": {"type": "array", "items": {"type": "string"}},
+                    "value_column": {"type": "string"},
+                    "node_property": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["label", "kind", "table"],
+            },
+        },
+        "relationships": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "source_table": {"type": "string"},
+                    "from": _END_SCHEMA,
+                    "to": _END_SCHEMA,
+                    "properties": {"type": "array", "items": {"type": "string"}},
+                    "description": {"type": "string"},
+                },
+                "required": ["type", "source_table", "from", "to"],
+            },
+        },
+    },
+    "required": ["nodes", "relationships"],
+}
 
 _PAGE_SIZE = 1000  # matches sql_engine.execute()'s cap — see graph_store._rows
 _SAMPLE_ROWS = 5
@@ -99,6 +155,9 @@ Rules:
     node) — never invent a property name that isn't declared on the target node.
 - Every table in the schema should be accounted for, as either a "table" node, a "value" node
   source, or a relationship's source_table (or more than one of these).
+- Give every node and relationship a one-sentence "description" of what it means in business
+  terms (e.g. "A customer placed this order") — these are shown to the model that later answers
+  questions over the graph, so say what it represents, not how it was derived.
 - Return ONLY the JSON object — no explanation, no markdown fences.
 """
 
@@ -138,20 +197,6 @@ def _distinct_values(schema: str, table: str, column: str, limit: int = _PAGE_SI
         schema=schema,
     )
     return [row[0] for row in result["rows"]]
-
-
-def _parse_ontology_json(raw: str) -> dict:
-    """Strip markdown fences / stray prose, then parse the JSON object."""
-    text = raw.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError(f"No JSON object found in the model LLM's output:\n{raw[:500]}")
-    try:
-        return json.loads(text[start : end + 1])
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Model LLM output was not valid JSON: {e}\nOutput:\n{text[:800]}") from e
 
 
 def _validate_model(model: dict, columns_by_table: dict[str, list[dict]]) -> None:
@@ -217,21 +262,9 @@ def _validate_model(model: dict, columns_by_table: dict[str, list[dict]]) -> Non
                 raise ValueError(f"Relationship {rel.get('type')} property {p!r} not in {rel['source_table']}")
 
 
-@mlflow.trace(name="graph_inference.infer_model", span_type=SpanType.CHAIN)
-async def infer_graph_model(schema: str) -> dict:
-    """
-    Read-only — does not touch Neo4j. Returns {"nodes": [...], "relationships":
-    [...]} — see _ONTOLOGY_PROMPT for the exact shape.
-
-    temperature=0 means a bare retry of the same prompt reproduces the same
-    output — no help if the model's *reasoning* was fine but it got the JSON
-    envelope wrong (e.g. returned a bare array instead of {"nodes":...,
-    "relationships":...}, which qwen3:4b did in testing). So on a parse/
-    validation failure, one self-correction pass shows the model its own
-    output plus the specific error and asks it to fix the structural problem
-    — a different input, so determinism doesn't block progress. Gives up
-    after that rather than looping indefinitely.
-    """
+def _gather_inputs(schema: str) -> tuple[dict, dict, dict]:
+    """Blocking catalog/DuckDB/DataHub reads for inference — run in a thread."""
+    sql_engine.validate_identifier(schema, "schema")
     tables = catalog.list_tables(schema)
     columns_by_table = {t: catalog.get_columns(schema, t) for t in tables}
     samples_by_table = {t: _sample_rows(schema, t) for t in tables}
@@ -240,6 +273,23 @@ async def infer_graph_model(schema: str) -> dict:
     enrichment_by_table = {
         t: datahub_client.get_table_context(settings.iceberg_catalog_name, schema, t) for t in tables
     }
+    return columns_by_table, samples_by_table, enrichment_by_table
+
+
+@mlflow.trace(name="graph_inference.infer_model", span_type=SpanType.CHAIN)
+async def infer_graph_model(schema: str) -> dict:
+    """
+    Read-only — does not touch the graph itself. Returns {"nodes": [...],
+    "relationships": [...]} — see _ONTOLOGY_PROMPT for the exact shape.
+
+    Output is constrained to ONTOLOGY_JSON_SCHEMA by Ollama, so the JSON
+    envelope is guaranteed. temperature=0 means a bare retry of the same
+    prompt reproduces the same output, so on a *semantic* validation failure
+    (unknown table/column/label) one self-correction pass shows the model its
+    own output plus the specific error — a different input, so determinism
+    doesn't block progress. Gives up after that rather than looping.
+    """
+    columns_by_table, samples_by_table, enrichment_by_table = await asyncio.to_thread(_gather_inputs, schema)
 
     def _col_str(c: dict, table_enrichment: dict) -> str:
         info = table_enrichment.get("columns", {}).get(c["name"], {})
@@ -267,22 +317,19 @@ async def infer_graph_model(schema: str) -> dict:
 
     prompt = _ONTOLOGY_PROMPT.format(schema=schema_text, samples=samples_text)
     # Ontology reasoning over a full schema + samples is heavier than a single
-    # NL->SQL translation — give it real budget rather than _call_ollama's
-    # 120s default (tuned for the much lighter query-translation case).
-    raw = await _call_ollama(prompt, timeout=300)
+    # NL->SQL translation — give it real budget.
+    model = await generate_json(prompt, ONTOLOGY_JSON_SCHEMA, timeout=300)
     try:
-        model = _parse_ontology_json(raw)
         _validate_model(model, columns_by_table)
         return model
     except ValueError as first_error:
         mlflow.update_current_trace(tags={"self_correction": "attempted"})
-        fix_prompt = _FIX_PROMPT.format(previous_output=raw, error=first_error)
-        raw2 = await _call_ollama(fix_prompt, timeout=300)
+        fix_prompt = _FIX_PROMPT.format(previous_output=json.dumps(model), error=first_error)
+        model2 = await generate_json(fix_prompt, ONTOLOGY_JSON_SCHEMA, timeout=300)
         try:
-            model = _parse_ontology_json(raw2)
-            _validate_model(model, columns_by_table)
+            _validate_model(model2, columns_by_table)
             mlflow.update_current_trace(tags={"self_correction": "succeeded"})
-            return model
+            return model2
         except ValueError as second_error:
             mlflow.update_current_trace(tags={"self_correction": "failed"})
             raise ValueError(
@@ -291,21 +338,60 @@ async def infer_graph_model(schema: str) -> dict:
             ) from second_error
 
 
-@mlflow.trace(name="graph_inference.materialize", span_type=SpanType.WORKFLOW)
-async def materialize_inferred_graph(schema: str, limit: int = 100_000) -> dict:
-    """Infers the model, then MERGEs it into Neo4j — idempotent."""
+async def infer_and_save_draft(schema: str) -> dict:
+    """Infer, then persist as a numbered draft so materialize can commit exactly this."""
     model = await infer_graph_model(schema)
+    version = await asyncio.to_thread(ontology_store.save_draft, schema, model)
+    return {**model, "ontology_version": version, "status": "draft"}
+
+
+@mlflow.trace(name="graph_inference.materialize", span_type=SpanType.WORKFLOW)
+async def materialize_inferred_graph(schema: str, limit: int = 100_000, ontology_version: int | None = None) -> dict:
+    """
+    MERGEs an ontology into Neo4j — idempotent.
+
+    With ontology_version: commits exactly that reviewed draft (re-validated
+    against the *current* tables, in case they changed since review). Without
+    it: infers a fresh model and saves it as a draft first (the old behavior,
+    kept for callers that skip review).
+    """
+    if ontology_version is None:
+        draft = await infer_and_save_draft(schema)
+        ontology_version = draft["ontology_version"]
+        model = {"nodes": draft["nodes"], "relationships": draft["relationships"]}
+    else:
+        stored = await asyncio.to_thread(ontology_store.get, schema, ontology_version)
+        if stored is None:
+            raise ValueError(f"No ontology version {ontology_version} for schema {schema!r}")
+        model = stored["model"]
+
+    result = await asyncio.to_thread(_materialize_model, schema, model, limit)
+    await asyncio.to_thread(ontology_store.activate, schema, ontology_version)
+    return {"model": model, "ontology_version": ontology_version, "status": "active", **result}
+
+
+def _materialize_model(schema: str, model: dict, limit: int) -> dict:
+    columns_by_table = {t: catalog.get_columns(schema, t) for t in catalog.list_tables(schema)}
+    _validate_model(model, columns_by_table)
+    for node in model["nodes"]:
+        sql_engine.validate_identifier(node["label"], "label")
+    for rel in model["relationships"]:
+        sql_engine.validate_identifier(rel["type"], "relationship type")
     nodes_by_label = {n["label"]: n for n in model["nodes"]}
+
+    def _batches(items: list) -> list[list]:
+        return [items[i : i + _WRITE_BATCH] for i in range(0, len(items), _WRITE_BATCH)]
 
     with graph_store._get_driver().session() as session:
         # Node identity is scoped per schema via _node_key (see graph_store.py's
-        # module docstring for the full rationale) — this is what stopped this
-        # feature's own test run from overwriting real ecommerce Product data
-        # when a test schema happened to reuse the same product_id values.
-        # Relationship MATCHing below still uses the real semantic property
-        # (pk_column / match_property), scoped by _schema, NOT _node_key —
-        # _node_key is always pk/value-based, so a value_lookup matching on a
-        # different property (e.g. Product.name) couldn't reconstruct it.
+        # module docstring for the full rationale). Relationship MATCHing
+        # below still uses the real semantic property (pk_column /
+        # match_property), scoped by _schema, NOT _node_key — _node_key is
+        # always pk/value-based, so a value_lookup matching on a different
+        # property (e.g. Product.name) couldn't reconstruct it.
+        #
+        # Writes are batched with UNWIND (one round trip per 1000 rows) —
+        # one session.run per row made a 100k-row table 100k round trips.
 
         # 1. Constraints + nodes, "table" kind first (real rows), then "value"
         #    kind (promoted columns) — relationships below assume both exist.
@@ -317,27 +403,28 @@ async def materialize_inferred_graph(schema: str, limit: int = 100_000) -> dict:
                 continue
             rows = graph_store._rows(schema, node["table"], node["pk_column"], limit)
             # Always set pk_column as a real property, even if the model's own
-            # "properties" list happened to omit it (observed varying between
-            # otherwise-identical inference runs) — the node's own id should
-            # always be queryable directly, not only reconstructable from
-            # _node_key.
-            props = list({node["pk_column"], *node["properties"]})
-            set_clause = ", ".join(f"n.{p} = $row.{p}" for p in props)
-            for row in rows:
+            # "properties" list happened to omit it — the node's own id should
+            # always be queryable directly, not only reconstructable from _node_key.
+            props = list({node["pk_column"], *node.get("properties", [])})
+            set_clause = ", ".join(f"n.`{p}` = row.data.`{p}`" for p in props)
+            payload = [{"key": f"{schema}:{r[node['pk_column']]}", "data": r} for r in rows]
+            for batch in _batches(payload):
                 session.run(
-                    f"MERGE (n:{node['label']} {{_node_key: $node_key}}) SET n._schema = $schema, {set_clause}",
-                    row=row, node_key=f"{schema}:{row[node['pk_column']]}", schema=schema,
+                    f"UNWIND $batch AS row MERGE (n:{node['label']} {{_node_key: row.key}}) "
+                    f"SET n._schema = $schema, {set_clause}",
+                    batch=batch, schema=schema,
                 )
 
         for node in model["nodes"]:
             if node["kind"] != "value":
                 continue
             values = _distinct_values(schema, node["table"], node["value_column"], limit)
-            for v in values:
+            payload = [{"key": f"{schema}:{v}", "v": v} for v in values]
+            for batch in _batches(payload):
                 session.run(
-                    f"MERGE (n:{node['label']} {{_node_key: $node_key}}) "
-                    f"SET n._schema = $schema, n.{node['node_property']} = $v",
-                    node_key=f"{schema}:{v}", schema=schema, v=v,
+                    f"UNWIND $batch AS row MERGE (n:{node['label']} {{_node_key: row.key}}) "
+                    f"SET n._schema = $schema, n.`{node['node_property']}` = row.v",
+                    batch=batch, schema=schema,
                 )
 
         # 2. Relationships — iterate each relationship's source_table once,
@@ -345,8 +432,13 @@ async def materialize_inferred_graph(schema: str, limit: int = 100_000) -> dict:
         def _match_clause(var: str, end: dict) -> str:
             label = end["label"]
             target = nodes_by_label[label]
-            match_prop = target["pk_column"] if end["kind"] in ("self", "id_lookup") else end["match_property"]
-            return f"({var}:{label} {{{match_prop}: ${var}_value, _schema: $schema}})"
+            if end["kind"] in ("self", "id_lookup"):
+                match_prop = target["pk_column"]
+            elif target["kind"] == "value":
+                match_prop = target["node_property"]
+            else:
+                match_prop = end["match_property"]
+            return f"({var}:{label} {{`{match_prop}`: row.{var}_value, _schema: $schema}})"
 
         def _end_value(end: dict, row: dict) -> object:
             if end["kind"] == "self":
@@ -363,18 +455,20 @@ async def materialize_inferred_graph(schema: str, limit: int = 100_000) -> dict:
             ) or catalog.get_columns(schema, rel["source_table"])[0]["name"]
             rows = graph_store._rows(schema, rel["source_table"], order_col, limit)
 
-            from_clause = _match_clause("a", rel["from"])
-            to_clause = _match_clause("b", rel["to"])
+            rel_props = rel.get("properties", [])
             set_clause = (
-                ("SET " + ", ".join(f"r.{p} = $row.{p}" for p in rel["properties"])) if rel["properties"] else ""
+                ("SET " + ", ".join(f"r.`{p}` = row.data.`{p}`" for p in rel_props)) if rel_props else ""
             )
-            for row in rows:
+            payload = [
+                {"a_value": _end_value(rel["from"], r), "b_value": _end_value(rel["to"], r), "data": r}
+                for r in rows
+            ]
+            for batch in _batches(payload):
                 session.run(
-                    f"MATCH {from_clause} MATCH {to_clause} MERGE (a)-[r:{rel['type']}]->(b) {set_clause}",
-                    row=row,
-                    a_value=_end_value(rel["from"], row),
-                    b_value=_end_value(rel["to"], row),
-                    schema=schema,
+                    f"UNWIND $batch AS row MATCH {_match_clause('a', rel['from'])} "
+                    f"MATCH {_match_clause('b', rel['to'])} "
+                    f"MERGE (a)-[r:{rel['type']}]->(b) {set_clause}",
+                    batch=batch, schema=schema,
                 )
 
     # Scoped to this schema, not graph_stats()'s global totals — same
@@ -387,4 +481,5 @@ async def materialize_inferred_graph(schema: str, limit: int = 100_000) -> dict:
     )
     counts = scoped[0] if scoped else {"nodes": 0, "relationships": 0}
     datahub_client.record_graph_build(schema, counts["nodes"], counts["relationships"])
-    return {"model": model, "stats": graph_store.graph_stats()}
+    write_log.record_graph_build(schema)
+    return {"stats": graph_store.graph_stats()}

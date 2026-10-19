@@ -30,10 +30,10 @@ if "role" not in st.session_state:
     st.session_state["role"] = "business"
 
 
-def call(method: str, path: str, **kwargs):
+def call(method: str, path: str, timeout: int = 120, **kwargs):
     headers = kwargs.pop("headers", {})
     headers["X-API-Key"] = _ROLE_KEYS.get(st.session_state.get("role", "business"), "")
-    resp = requests.request(method, f"{GATEWAY_URL}{path}", timeout=120, headers=headers, **kwargs)
+    resp = requests.request(method, f"{GATEWAY_URL}{path}", timeout=timeout, headers=headers, **kwargs)
     if resp.status_code == 401:
         raise RuntimeError("401: Missing or invalid API key for the selected role.")
     if resp.status_code == 403:
@@ -70,6 +70,15 @@ def _render_table(columns: list[str], row_dicts: list[dict]) -> None:
         f"<thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table></div>"
     )
     st.markdown(table_html, unsafe_allow_html=True)
+
+
+def caption_rows(result: dict, extra: str = "") -> None:
+    st.caption(f"{result['row_count']} rows{extra}")
+    if result.get("truncated"):
+        st.warning(
+            f"Result truncated at {result['row_count']} rows — add filters, aggregation, or a LIMIT "
+            "before treating it as complete."
+        )
 
 
 def show_rows(columns: list[str], rows: list[list]) -> None:
@@ -141,7 +150,9 @@ with st.sidebar:
         st.caption("Graph is empty — run build_knowledge_graph first.")
 
 # ── Query tabs ────────────────────────────────────────────────────────────
-tab_nl, tab_sql, tab_cypher = st.tabs(["🗣 Natural language", "🧮 SQL", "🕸 Cypher"])
+tab_nl, tab_graph_nl, tab_sql, tab_cypher = st.tabs(
+    ["🗣 Natural language", "🧠 Graph question", "🧮 SQL", "🕸 Cypher"]
+)
 
 with tab_nl:
     st.subheader("Ask a question in plain English")
@@ -169,8 +180,47 @@ with tab_nl:
                     )
                     if result.get("generated_sql"):
                         st.code(result["generated_sql"], language="sql")
-                    st.caption(f"{result['row_count']} rows · {'cached' if result.get('cached') else 'fresh'}")
+                    caption_rows(result, f" · {'cached' if result.get('cached') else 'fresh'}")
                     show_rows(result["columns"], result["rows"])
+                except Exception as e:
+                    st.error(str(e))
+
+with tab_graph_nl:
+    st.subheader("Ask the knowledge graph")
+    st.caption(
+        "Answered by the local LLM: Cypher grounded on the live schema, the active ontology and "
+        "verified examples, checked with EXPLAIN, repaired if needed, then run read-only."
+    )
+    gq = st.text_area(
+        "Question",
+        placeholder="e.g. What else did customers who bought Wireless Noise-Cancelling Headphones also buy?",
+        key="gnl_question",
+    )
+    g1, g2 = st.columns([3, 1])
+    with g1:
+        gnl_schema = st.text_input("Schema (optional)", key="gnl_schema")
+    with g2:
+        g_answer = st.checkbox("Write an answer", value=True, key="gnl_answer")
+    if st.button("Ask", key="gnl_run", type="primary"):
+        if not gq.strip():
+            st.warning("Enter a question first.")
+        else:
+            with st.spinner("Local LLM is writing and checking the query... (can take a few minutes)"):
+                try:
+                    result = call(
+                        "POST", "/graph/nl", timeout=900,
+                        json={"question": gq, "schema": gnl_schema or None, "answer": g_answer},
+                    )
+                    if result.get("answer"):
+                        st.success(result["answer"])
+                    st.code(result["cypher"], language="cypher")
+                    st.caption(
+                        f"{result['count']} records · {result['attempts']} attempt(s)"
+                        + (f" · ontology v{result['ontology_version']}" if result.get("ontology_version") else "")
+                    )
+                    show_records(result["records"])
+                    with st.expander("How it got there"):
+                        st.json({"attempts": result["attempt_history"], "examples_used": result["examples_used"]})
                 except Exception as e:
                     st.error(str(e))
 
@@ -190,7 +240,7 @@ with tab_sql:
             with st.spinner("Running..."):
                 try:
                     result = call("POST", "/query/sql", json={"sql": sql, "schema": sql_schema or None})
-                    st.caption(f"{result['row_count']} rows")
+                    caption_rows(result)
                     show_rows(result["columns"], result["rows"])
                 except Exception as e:
                     st.error(str(e))

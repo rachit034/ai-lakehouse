@@ -15,6 +15,7 @@ output is validated before use, not trusted because it "looks like SQL".
 """
 from __future__ import annotations
 
+import asyncio
 import re
 
 import mlflow
@@ -22,7 +23,7 @@ import sqlglot
 from mlflow.entities import SpanType
 from sqlglot import exp
 
-from services import catalog, datahub_client, llm, sql_engine
+from services import catalog, datahub_client, llm, sql_engine, write_log
 
 _TABLE_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -75,7 +76,9 @@ async def run_gold_query(
     materialize: bool = False,
     table_name: str | None = None,
 ) -> dict:
-    schema_ctx = catalog.build_schema_context(schema=source_schema)
+    # Blocking catalog/DuckDB/DataHub calls run via asyncio.to_thread so this
+    # coroutine never stalls the gateway's event loop.
+    schema_ctx = await asyncio.to_thread(catalog.build_schema_context, schema=source_schema)
     if not schema_ctx.strip():
         raise ValueError(f"No tables found in schema '{source_schema}'.")
 
@@ -89,7 +92,7 @@ async def run_gold_query(
     sql_engine._assert_read_only(select_sql)
 
     if not materialize:
-        result = sql_engine.execute(select_sql, schema=source_schema)
+        result = await asyncio.to_thread(sql_engine.execute, select_sql, schema=source_schema)
         return {**result, "generated_sql": select_sql, "materialized": False}
 
     if not table_name or not _TABLE_NAME_RE.match(table_name):
@@ -105,14 +108,17 @@ async def run_gold_query(
     # the guarantee airtight rather than assumed.
     sql_engine._assert_read_only(ctas_sql)
 
-    sql_engine.ensure_schema("gold")
-    sql_engine.execute_ddl(
-        f"CREATE TABLE IF NOT EXISTS iceberg.gold.{table_name} AS {ctas_sql}"
-    )
-    count_result = sql_engine.execute(f"SELECT count(*) AS n FROM iceberg.gold.{table_name}")
-    row_count = count_result["rows"][0][0]
+    def _materialize() -> int:
+        sql_engine.ensure_schema("gold")
+        sql_engine.execute_ddl(
+            f"CREATE TABLE IF NOT EXISTS iceberg.gold.{table_name} AS {ctas_sql}"
+        )
+        count_result = sql_engine.execute(f"SELECT count(*) AS n FROM iceberg.gold.{table_name}")
+        _register_gold_lineage(table_name, question, source_tables)
+        write_log.record_write("gold")
+        return count_result["rows"][0][0]
 
-    _register_gold_lineage(table_name, question, source_tables)
+    row_count = await asyncio.to_thread(_materialize)
 
     return {
         "materialized": True,
